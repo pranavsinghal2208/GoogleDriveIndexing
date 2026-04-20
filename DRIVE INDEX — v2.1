@@ -1,0 +1,1217 @@
+/**
+ * ============================================================
+ * DRIVE INDEX — v2.1
+ * ============================================================
+ * Architecture:
+ *   Phase 1 → Full Index (run once, auto-resumes until 100% done)
+ *   Phase 2 → Enrichment (auto, every 1 min until complete)
+ *   Phase 3 → Delta Mode (auto, daily at 7am, forever)
+ *
+ * Required Google Services (enable in Apps Script → Services):
+ *   - Drive API (Advanced)
+ *   - Drive Activity API
+ *
+ * Sheet tabs produced:
+ *   - LABWERK_DRIVE_INDEX   → main file index
+ *   - LABWERK_SUMMARY       → auto-generated dashboard
+ *
+ * Author: Built for LAB (Architecture Firm) via LABWERK
+ * ============================================================
+ */
+
+
+/* ============================================================
+   SECTION 0 — MASTER CONFIG
+   ============================================================ */
+
+const CFG = {
+
+  // Sheet names
+  indexSheet:   "LABWERK_DRIVE_INDEX",
+  summarySheet: "LABWERK_SUMMARY",
+
+  // Full index settings
+  fullIndex: {
+    pageSize:      500,
+    writeBatch:    200,
+    maxRunMs:      5 * 60 * 1000 - 20 * 1000   // 4m40s safety margin
+  },
+
+  // Delta settings
+  // Runs once daily at 7am after full index completes
+  delta: {
+    triggerHour:         7,      // 7am daily — change to any hour (0–23)
+    pageSize:            200,
+    maxActivitiesPerRun: 1000
+  },
+
+  // Folder path settings
+  folderPath: {
+    maxDepth:     12,
+    cacheTtlSecs: 21600   // 6 hours
+  },
+
+  // Script property keys
+  props: {
+    ssId:              "LW_SPREADSHEET_ID",
+    fullIndexToken:    "LW_FULL_INDEX_TOKEN",
+    fullIndexDone:     "LW_FULL_INDEX_DONE",
+    fullIndexDoneAt:   "LW_FULL_INDEX_DONE_AT",
+    deltaCursor:       "LW_DELTA_CURSOR",
+    deltaActive:       "LW_DELTA_ACTIVE",
+    deptRow:           "LW_DEPT_ROW",
+    pathRow:           "LW_PATH_ROW"
+  },
+
+  // All index columns — single source of truth
+  columns: [
+    "file_id",
+    "file_name",
+    "link",
+    "mime_type",
+    "file_type",
+    "file_size_bytes",
+    "owner_email",
+    "created_time",
+    "last_modified",
+    "general_access",
+    "is_public",
+    "parent_folder_ids",
+    "folder_path",
+    "project_name",
+    "department",
+    "age_bucket",
+    "is_orphaned",
+    "is_duplicate",
+    "security_risk",
+    "status",
+    "last_delta_event",
+    "last_delta_at",
+    "first_indexed_at"
+  ]
+};
+
+
+/* ============================================================
+   SECTION 1 — MENU
+   ============================================================ */
+
+function onOpen() {
+  // getUi() only works when a human has the sheet open in a browser.
+  // Time-based triggers call onOpen without a UI context — this guard
+  // prevents the "Cannot call getUi() from this context" error.
+  try {
+    SpreadsheetApp.getUi()
+      .createMenu("LABWERK Index")
+      .addItem("▶ Run Full Index (first time only)", "runFullIndex")
+      .addSeparator()
+      .addItem("⚡ Start Delta Mode (if stopped)",   "startDeltaMode")
+      .addItem("⏹ Stop Delta Mode",                  "stopDeltaMode")
+      .addSeparator()
+      .addItem("📊 Refresh Summary Sheet",            "refreshSummarySheet")
+      .addItem("🔍 Show Status",                      "showStatus")
+      .addSeparator()
+      .addItem("⚙ Setup (run first ever)",            "setup")
+      .addToUi();
+  } catch(e) {
+    // Running in background/trigger context — no UI available, safe to ignore
+    console.log("onOpen: no UI context, menu skipped.");
+  }
+}
+
+
+/* ============================================================
+   SECTION 2 — SETUP
+   ============================================================ */
+
+function setup() {
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+  const ssId = ss.getId();
+  const props = PropertiesService.getScriptProperties();
+
+  props.setProperty(CFG.props.ssId, ssId);
+
+  // Ensure index sheet exists with correct headers
+  const sh = getOrCreateSheet_(ss, CFG.indexSheet);
+  const existingHeaders = sh.getLastColumn() > 0
+    ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim())
+    : [];
+
+  // Only write headers if sheet is truly empty or headers mismatch
+  if (existingHeaders.join(",") !== CFG.columns.join(",")) {
+    if (sh.getLastRow() === 0) {
+      sh.getRange(1, 1, 1, CFG.columns.length).setValues([CFG.columns]);
+      formatHeaderRow_(sh);
+    } else {
+      // Add any missing columns to the right
+      addMissingColumns_(sh, existingHeaders);
+    }
+  }
+
+  // Ensure summary sheet exists
+  getOrCreateSheet_(ss, CFG.summarySheet);
+
+  note_(sh, `SETUP DONE. SS_ID stored.\nTime: ${new Date().toISOString()}`);
+  SpreadsheetApp.getUi().alert("Setup complete. You can now run Full Index from the menu.");
+}
+
+function addMissingColumns_(sh, existingHeaders) {
+  CFG.columns.forEach(col => {
+    if (!existingHeaders.includes(col)) {
+      const newCol = sh.getLastColumn() + 1;
+      sh.getRange(1, newCol).setValue(col);
+    }
+  });
+}
+
+
+/* ============================================================
+   SECTION 3 — FULL INDEX
+   ============================================================ */
+
+function runFullIndex() {
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sh    = getOrCreateSheet_(ss, CFG.indexSheet);
+  const props = PropertiesService.getScriptProperties();
+
+  // Store SS ID
+  props.setProperty(CFG.props.ssId, ss.getId());
+
+  // Clear data rows only (keep header)
+  if (sh.getLastRow() > 1) {
+    sh.deleteRows(2, sh.getLastRow() - 1);
+  }
+
+  // Reset full index state
+  props.deleteProperty(CFG.props.fullIndexToken);
+  props.deleteProperty(CFG.props.fullIndexDone);
+  props.deleteProperty(CFG.props.deltaCursor);
+
+  // Set up auto-resume trigger — fires every 1 min until index is done
+  // This means you never have to manually click Resume
+  deleteTriggersByHandler_("resumeFullIndex");
+  ScriptApp.newTrigger("resumeFullIndex")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+
+  note_(sh, `Full index STARTED @ ${new Date().toISOString()}\nAuto-resume trigger active — will complete without manual intervention.`);
+  resumeFullIndex();
+}
+
+function resumeFullIndex() {
+  const start  = Date.now();
+  const sh     = getIndexSheet_();
+  const props  = PropertiesService.getScriptProperties();
+  const colMap = getHeaderMap_(sh);
+
+  let pageToken = props.getProperty(CFG.props.fullIndexToken) || null;
+  let buffer    = [];
+
+  while (true) {
+    const resp  = listFilesPage_(pageToken);
+    const files = resp.files || [];
+
+    for (const f of files) {
+      buffer.push(buildRowFromFileMeta_(f, colMap));
+
+      if (buffer.length >= CFG.fullIndex.writeBatch) {
+        appendRows_(sh, buffer, colMap);
+        buffer = [];
+      }
+
+      if ((Date.now() - start) > CFG.fullIndex.maxRunMs) {
+        if (buffer.length) appendRows_(sh, buffer, colMap);
+        props.setProperty(CFG.props.fullIndexToken, resp.nextPageToken || "");
+        note_(sh, `Full index PARTIAL — resume needed.\nToken saved.\nTime: ${new Date().toISOString()}`);
+        return;
+      }
+    }
+
+    if (!resp.nextPageToken) break;
+    pageToken = resp.nextPageToken;
+  }
+
+  if (buffer.length) appendRows_(sh, buffer, colMap);
+
+  // ── Full index complete ──────────────────────────────────
+  // Kill the auto-resume trigger — job done
+  deleteTriggersByHandler_("resumeFullIndex");
+
+  props.deleteProperty(CFG.props.fullIndexToken);
+  props.setProperty(CFG.props.fullIndexDone,   "true");
+  props.setProperty(CFG.props.fullIndexDoneAt, new Date().toISOString());
+
+  // Store a Drive Activity cursor starting from NOW
+  // so delta mode only picks up changes after the full index
+  storeFreshDeltaCursor_();
+
+  // Kick off enrichment passes
+  startEnrichmentTriggers_();
+
+  note_(sh, `Full index DONE @ ${new Date().toISOString()}\nDelta cursor stored. Enrichment starting.`);
+}
+
+
+/* ============================================================
+   SECTION 4 — DELTA MODE
+   ============================================================ */
+
+function startDeltaMode() {
+  const props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty(CFG.props.fullIndexDone) !== "true") {
+    SpreadsheetApp.getUi().alert("Full index has not completed yet. Run full index first.");
+    return;
+  }
+
+  stopDeltaMode(); // clear any existing
+
+  // Runs once daily at the configured hour (default 7am)
+  ScriptApp.newTrigger("runDeltaIndex")
+    .timeBased()
+    .atHour(CFG.delta.triggerHour)
+    .everyDays(1)
+    .create();
+
+  props.setProperty(CFG.props.deltaActive, "true");
+  note_(getIndexSheet_(), `Delta mode STARTED — daily at ${CFG.delta.triggerHour}:00\nTime: ${new Date().toISOString()}`);
+}
+
+function stopDeltaMode() {
+  deleteTriggersByHandler_("runDeltaIndex");
+  PropertiesService.getScriptProperties().deleteProperty(CFG.props.deltaActive);
+  console.log("Delta mode stopped.");
+}
+
+function runDeltaIndex() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    console.log("Delta: could not acquire lock — skipping run.");
+    return;
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+
+    if (props.getProperty(CFG.props.fullIndexDone) !== "true") {
+      console.log("Delta: full index not done — skipping.");
+      return;
+    }
+
+    const cursor = props.getProperty(CFG.props.deltaCursor) || "";
+    processDeltaActivities_(cursor);
+
+  } catch(e) {
+    console.error("Delta run error:", e.message || e);
+    note_(getIndexSheet_(), `Delta ERROR: ${e.message || e}\nTime: ${new Date().toISOString()}`);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function processDeltaActivities_(cursor) {
+  const sh     = getIndexSheet_();
+  const props  = PropertiesService.getScriptProperties();
+  const colMap = getHeaderMap_(sh);
+
+  // ── Fetch activity page ───────────────────────────────────
+  const reqBody = { pageSize: CFG.delta.pageSize };
+  if (cursor) reqBody.pageToken = cursor;
+
+  let resp;
+  try {
+    resp = DriveActivity.Activity.query(reqBody);
+  } catch(e) {
+    console.error("Drive Activity API error:", e.message);
+    return;
+  }
+
+  const activities = resp.activities || [];
+  if (!activities.length) {
+    props.setProperty(CFG.props.deltaCursor, resp.nextPageToken || cursor);
+    console.log("Delta: no new activity.");
+    return;
+  }
+
+  // ── Deduplicate by file ID ────────────────────────────────
+  // If the same file had multiple events, process the latest one
+  const fileEventMap = {};
+  for (const activity of activities) {
+    const fileId    = extractFileIdFromActivity_(activity);
+    const eventType = extractEventType_(activity);
+    if (fileId && eventType) {
+      fileEventMap[fileId] = eventType; // last event wins
+    }
+  }
+
+  // ── Build row map for fast lookup ─────────────────────────
+  const rowMap = buildFileIdRowMap_(sh, colMap);
+
+  // ── Process each unique file ──────────────────────────────
+  let created = 0, updated = 0, deleted = 0, skipped = 0;
+
+  for (const [fileId, eventType] of Object.entries(fileEventMap)) {
+    const existingRow = rowMap[fileId];
+
+    try {
+      if (eventType === "DELETE") {
+        if (existingRow) {
+          markDeleted_(sh, existingRow, colMap);
+          deleted++;
+        }
+
+      } else if (!existingRow) {
+        // File not in index — fetch and append
+        const meta = fetchFileMeta_(fileId);
+        if (meta) {
+          appendRows_(sh, [buildRowFromFileMeta_(meta, colMap, eventType)], colMap);
+          created++;
+        }
+
+      } else {
+        // File exists — update in place
+        updateExistingRow_(sh, existingRow, fileId, eventType, colMap);
+        updated++;
+      }
+
+    } catch(e) {
+      console.error(`Delta: error processing ${fileId} (${eventType}):`, e.message);
+      skipped++;
+    }
+  }
+
+  // ── Save cursor ───────────────────────────────────────────
+  props.setProperty(CFG.props.deltaCursor, resp.nextPageToken || cursor);
+
+  const summary = `Delta run complete.\nCreated: ${created} | Updated: ${updated} | Deleted: ${deleted} | Skipped: ${skipped}\nTime: ${new Date().toISOString()}`;
+  console.log(summary);
+  note_(sh, summary);
+
+  // If there are more pages, schedule immediate continuation
+  if (resp.nextPageToken) {
+    processDeltaActivities_(resp.nextPageToken);
+  }
+}
+
+
+/* ============================================================
+   SECTION 5 — ROW OPERATIONS
+   ============================================================ */
+
+function buildRowFromFileMeta_(f, colMap, deltaEvent) {
+  const now        = new Date().toISOString();
+  const ownerEmail = (f.owners && f.owners[0] && f.owners[0].emailAddress) || "";
+  const access     = getGeneralAccess_(f.id);
+  const parentIds  = normalizeParentIds_(f.parents);
+  const folderPath = parentIds.length ? buildFolderPath_(parentIds[0]) : "(no parent)";
+  const fileType   = mimeToFileType_(f.mimeType || "");
+  const ageBucket  = getAgeBucket_(f.modifiedTime);
+  const dept       = classifyDepartment_(folderPath, f.name || "");
+  const project    = extractProjectName_(folderPath);
+  const isOrphan   = (!parentIds.length) ? "YES" : "NO";
+  const isPublic   = (access === "Anyone with link") ? "YES" : "NO";
+  const risk       = computeSecurityRisk_(dept, access);
+
+  // Build a row aligned to CFG.columns
+  const row = new Array(CFG.columns.length).fill("");
+
+  const set = (col, val) => {
+    const idx = CFG.columns.indexOf(col);
+    if (idx >= 0) row[idx] = val ?? "";
+  };
+
+  set("file_id",          f.id || "");
+  set("file_name",        f.name || "");
+  set("link",             f.webViewLink || "");
+  set("mime_type",        f.mimeType || "");
+  set("file_type",        fileType);
+  set("file_size_bytes",  f.size ? Number(f.size) : "");
+  set("owner_email",      ownerEmail);
+  set("created_time",     f.createdTime || "");
+  set("last_modified",    f.modifiedTime || "");
+  set("general_access",   access);
+  set("is_public",        isPublic);
+  set("parent_folder_ids", parentIds.join(","));
+  set("folder_path",      folderPath);
+  set("project_name",     project);
+  set("department",       dept);
+  set("age_bucket",       ageBucket);
+  set("is_orphaned",      isOrphan);
+  set("is_duplicate",     "");       // filled by dedup pass
+  set("security_risk",    risk);
+  set("status",           deltaEvent ? "CREATED" : "OK");
+  set("last_delta_event", deltaEvent || "");
+  set("last_delta_at",    deltaEvent ? now : "");
+  set("first_indexed_at", now);
+
+  return row;
+}
+
+function updateExistingRow_(sh, rowNum, fileId, eventType, colMap) {
+  const now = new Date().toISOString();
+
+  // Fetch fresh metadata
+  const meta = fetchFileMeta_(fileId);
+  if (!meta) return;
+
+  const access     = getGeneralAccess_(fileId);
+  const parentIds  = normalizeParentIds_(meta.parents);
+  const folderPath = parentIds.length ? buildFolderPath_(parentIds[0]) : "(no parent)";
+  const dept       = classifyDepartment_(folderPath, meta.name || "");
+  const project    = extractProjectName_(folderPath);
+  const ageBucket  = getAgeBucket_(meta.modifiedTime);
+  const isPublic   = (access === "Anyone with link") ? "YES" : "NO";
+  const risk       = computeSecurityRisk_(dept, access);
+
+  const updates = {
+    "file_name":         meta.name || "",
+    "link":              meta.webViewLink || "",
+    "file_size_bytes":   meta.size ? Number(meta.size) : "",
+    "last_modified":     meta.modifiedTime || "",
+    "general_access":    access,
+    "is_public":         isPublic,
+    "parent_folder_ids": parentIds.join(","),
+    "folder_path":       folderPath,
+    "project_name":      project,
+    "department":        dept,
+    "age_bucket":        ageBucket,
+    "security_risk":     risk,
+    "status":            eventType,
+    "last_delta_event":  eventType,
+    "last_delta_at":     now
+  };
+
+  // Write each updated field individually
+  for (const [col, val] of Object.entries(updates)) {
+    const colNum = colMap[col];
+    if (colNum) sh.getRange(rowNum, colNum).setValue(val);
+  }
+}
+
+function markDeleted_(sh, rowNum, colMap) {
+  const now = new Date().toISOString();
+  const updates = {
+    "status":           "DELETED",
+    "is_public":        "NO",
+    "general_access":   "Deleted",
+    "last_delta_event": "DELETE",
+    "last_delta_at":    now
+  };
+  for (const [col, val] of Object.entries(updates)) {
+    const colNum = colMap[col];
+    if (colNum) sh.getRange(rowNum, colNum).setValue(val);
+  }
+}
+
+function appendRows_(sh, rows, colMap) {
+  if (!rows.length) return;
+  const startRow = sh.getLastRow() + 1;
+  sh.getRange(startRow, 1, rows.length, CFG.columns.length).setValues(rows);
+}
+
+
+/* ============================================================
+   SECTION 6 — ENRICHMENT TRIGGERS
+   (Dept + FolderPath pass after full index)
+   ============================================================ */
+
+function startEnrichmentTriggers_() {
+  // These run once after full index to fill dept + folder_path
+  // for the batch that was written without path resolution
+  // (path resolution during full index is too slow per-file)
+  deleteTriggersByHandler_("enrichFolderPath_Auto");
+  PropertiesService.getScriptProperties().setProperty(CFG.props.pathRow, "2");
+
+  ScriptApp.newTrigger("enrichFolderPath_Auto")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+}
+
+function enrichFolderPath_Auto() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+
+  try {
+    const done = enrichFolderPath_Batch_();
+    if (done) {
+      deleteTriggersByHandler_("enrichFolderPath_Auto");
+      PropertiesService.getScriptProperties().deleteProperty(CFG.props.pathRow);
+
+      // After path enrichment, run dedup pass
+      runDuplicateDetection();
+
+      // Auto-start delta mode
+      startDeltaMode();
+
+      note_(getIndexSheet_(), `Enrichment DONE. Delta mode auto-started.\nTime: ${new Date().toISOString()}`);
+    }
+  } catch(e) {
+    note_(getIndexSheet_(), `Enrichment ERROR: ${e.message}\nTime: ${new Date().toISOString()}`);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function enrichFolderPath_Batch_() {
+  const sh     = getIndexSheet_();
+  const props  = PropertiesService.getScriptProperties();
+  const colMap = getHeaderMap_(sh);
+
+  const cId      = colMap["file_id"];
+  const cPath    = colMap["folder_path"];
+  const cParents = colMap["parent_folder_ids"];
+  const cDept    = colMap["department"];
+  const cProject = colMap["project_name"];
+  const cName    = colMap["file_name"];
+  const cAge     = colMap["age_bucket"];
+  const cRisk    = colMap["security_risk"];
+  const cAccess  = colMap["general_access"];
+
+  if (!cId || !cPath) throw new Error("Missing required columns");
+
+  let   startRow = Number(props.getProperty(CFG.props.pathRow) || 2);
+  const lastRow  = sh.getLastRow();
+  if (startRow > lastRow) return true;
+
+  const batchSize = 100; // Drive API calls — keep small
+  const endRow    = Math.min(lastRow, startRow + batchSize - 1);
+  const n         = endRow - startRow + 1;
+
+  const ids     = sh.getRange(startRow, cId,   n, 1).getValues();
+  const paths   = sh.getRange(startRow, cPath, n, 1).getValues();
+  const names   = sh.getRange(startRow, cName, n, 1).getValues();
+  const accesses= sh.getRange(startRow, cAccess, n, 1).getValues();
+
+  for (let i = 0; i < n; i++) {
+    const fileId       = String(ids[i][0] || "").trim();
+    const existingPath = String(paths[i][0] || "").trim();
+
+    // Skip if path already resolved
+    if (!fileId || existingPath.length >= 3) continue;
+
+    try {
+      const meta      = retryDriveGet_(fileId, "parents,modifiedTime");
+      const parentIds = normalizeParentIds_(meta.parents);
+      const path      = parentIds.length ? buildFolderPath_(parentIds[0]) : "(no parent)";
+      const dept      = classifyDepartment_(path, String(names[i][0] || ""));
+      const project   = extractProjectName_(path);
+      const age       = getAgeBucket_(String(meta.modifiedTime || ""));
+      const access    = String(accesses[i][0] || "");
+      const risk      = computeSecurityRisk_(dept, access);
+      const row       = startRow + i;
+
+      sh.getRange(row, cParents).setValue(parentIds.join(","));
+      sh.getRange(row, cPath).setValue(path);
+      sh.getRange(row, cDept).setValue(dept);
+      sh.getRange(row, cProject).setValue(project);
+      sh.getRange(row, cAge).setValue(age);
+      sh.getRange(row, cRisk).setValue(risk);
+
+    } catch(e) {
+      // Leave blank — will be retried if delta picks it up
+    }
+  }
+
+  props.setProperty(CFG.props.pathRow, String(endRow + 1));
+  note_(sh, `Enrichment: rows ${startRow}–${endRow} / ${lastRow}\nNext: ${endRow + 1}\nTime: ${new Date().toISOString()}`);
+
+  return false;
+}
+
+
+/* ============================================================
+   SECTION 7 — DUPLICATE DETECTION
+   ============================================================ */
+
+function runDuplicateDetection() {
+  const sh     = getIndexSheet_();
+  const colMap = getHeaderMap_(sh);
+  const cName  = colMap["file_name"];
+  const cDup   = colMap["is_duplicate"];
+
+  if (!cName || !cDup) return;
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+
+  const n     = lastRow - 1;
+  const names = sh.getRange(2, cName, n, 1).getValues().map(r => String(r[0] || "").trim().toLowerCase());
+
+  // Count occurrences
+  const counts = {};
+  names.forEach(name => {
+    if (name) counts[name] = (counts[name] || 0) + 1;
+  });
+
+  // Write YES/NO
+  const out = names.map(name => [counts[name] > 1 ? "YES" : "NO"]);
+  sh.getRange(2, cDup, n, 1).setValues(out);
+}
+
+
+/* ============================================================
+   SECTION 8 — SUMMARY SHEET
+   ============================================================ */
+
+function refreshSummarySheet() {
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const indexSh = getIndexSheet_();
+  const sumSh   = getOrCreateSheet_(ss, CFG.summarySheet);
+  const colMap  = getHeaderMap_(indexSh);
+
+  const lastRow = indexSh.getLastRow();
+  if (lastRow < 2) return;
+
+  const n        = lastRow - 1;
+  const depts    = indexSh.getRange(2, colMap["department"],     n, 1).getValues();
+  const owners   = indexSh.getRange(2, colMap["owner_email"],    n, 1).getValues();
+  const isPublic = indexSh.getRange(2, colMap["is_public"],      n, 1).getValues();
+  const ages     = indexSh.getRange(2, colMap["age_bucket"],     n, 1).getValues();
+  const risks    = indexSh.getRange(2, colMap["security_risk"],  n, 1).getValues();
+  const statuses = indexSh.getRange(2, colMap["status"],         n, 1).getValues();
+  const projects = indexSh.getRange(2, colMap["project_name"],   n, 1).getValues();
+  const sizes    = indexSh.getRange(2, colMap["file_size_bytes"],n, 1).getValues();
+  const dups     = indexSh.getRange(2, colMap["is_duplicate"],   n, 1).getValues();
+  const orphans  = indexSh.getRange(2, colMap["is_orphaned"],    n, 1).getValues();
+
+  // ── Aggregate ─────────────────────────────────────────────
+  const deptCount    = {};
+  const ownerCount   = {};
+  const projectCount = {};
+  const ownerSize    = {};
+  let   publicCount  = 0;
+  let   staleCount   = 0;
+  let   archiveCount = 0;
+  let   highRisk     = 0;
+  let   medRisk      = 0;
+  let   deletedCount = 0;
+  let   dupCount     = 0;
+  let   orphanCount  = 0;
+  let   totalSize    = 0;
+
+  for (let i = 0; i < n; i++) {
+    const dept    = String(depts[i][0]    || "Uncategorized");
+    const owner   = String(owners[i][0]   || "(unknown)");
+    const pub     = String(isPublic[i][0] || "");
+    const age     = String(ages[i][0]     || "");
+    const risk    = String(risks[i][0]    || "");
+    const status  = String(statuses[i][0] || "");
+    const project = String(projects[i][0] || "(unassigned)");
+    const size    = Number(sizes[i][0])   || 0;
+    const dup     = String(dups[i][0]     || "");
+    const orphan  = String(orphans[i][0]  || "");
+
+    if (status === "DELETED") { deletedCount++; continue; }
+
+    deptCount[dept]       = (deptCount[dept]    || 0) + 1;
+    ownerCount[owner]     = (ownerCount[owner]  || 0) + 1;
+    projectCount[project] = (projectCount[project] || 0) + 1;
+    ownerSize[owner]      = (ownerSize[owner]   || 0) + size;
+
+    if (pub    === "YES")    publicCount++;
+    if (age    === "Stale")  staleCount++;
+    if (age    === "Archive") archiveCount++;
+    if (risk   === "🔴 High")  highRisk++;
+    if (risk   === "🟡 Medium") medRisk++;
+    if (dup    === "YES")    dupCount++;
+    if (orphan === "YES")    orphanCount++;
+    totalSize += size;
+  }
+
+  // ── Write summary ─────────────────────────────────────────
+  sumSh.clearContents();
+
+  const rows = [];
+
+  rows.push(["LABWERK DRIVE INDEX — SUMMARY", "", `Last refreshed: ${new Date().toISOString()}`]);
+  rows.push([]);
+
+  rows.push(["── OVERALL ──", "", ""]);
+  rows.push(["Total files (active)", n - deletedCount, ""]);
+  rows.push(["Deleted files",        deletedCount, ""]);
+  rows.push(["Total size (GB)",      (totalSize / 1e9).toFixed(2), ""]);
+  rows.push(["Publicly accessible",  publicCount, ""]);
+  rows.push(["Stale files (>6 mo)",  staleCount, ""]);
+  rows.push(["Archive files (>2 yr)", archiveCount, ""]);
+  rows.push(["Duplicates",           dupCount, ""]);
+  rows.push(["Orphaned files",       orphanCount, ""]);
+  rows.push([]);
+
+  rows.push(["── SECURITY RISK ──", "", ""]);
+  rows.push(["🔴 High Risk",   highRisk, ""]);
+  rows.push(["🟡 Medium Risk", medRisk,  ""]);
+  rows.push([]);
+
+  rows.push(["── FILES BY DEPARTMENT ──", "Count", ""]);
+  Object.entries(deptCount).sort((a,b) => b[1]-a[1]).forEach(([dept, count]) => {
+    rows.push([dept, count, ""]);
+  });
+  rows.push([]);
+
+  rows.push(["── FILES BY PROJECT ──", "Count", ""]);
+  Object.entries(projectCount).sort((a,b) => b[1]-a[1]).slice(0, 20).forEach(([proj, count]) => {
+    rows.push([proj, count, ""]);
+  });
+  rows.push([]);
+
+  rows.push(["── FILES BY OWNER ──", "Count", "Size (MB)"]);
+  Object.entries(ownerCount).sort((a,b) => b[1]-a[1]).forEach(([owner, count]) => {
+    rows.push([owner, count, ((ownerSize[owner] || 0) / 1e6).toFixed(1)]);
+  });
+
+  sumSh.getRange(1, 1, rows.length, 3).setValues(rows);
+
+  // Basic formatting
+  sumSh.getRange("A1").setFontSize(13).setFontWeight("bold");
+  sumSh.autoResizeColumns(1, 3);
+}
+
+
+/* ============================================================
+   SECTION 9 — CLASSIFIERS & ENRICHERS
+   ============================================================ */
+
+function classifyDepartment_(folderPath, fileName) {
+  const p = String(folderPath || "").toLowerCase().replace(/\s+/g, " ");
+  const n = String(fileName   || "").toLowerCase();
+
+  // Path signals are stronger than name signals
+  if (/(accounts|accounting|finance|billing|invoice|gst|tds|payments?|receivables?|bank)/.test(p))
+    return "Finance / Accounts";
+  if (/(hr|human resources|admin|attendance|payroll|recruit|onboarding|appraisal|policy|people ops)/.test(p))
+    return "HR / Admin";
+  if (/(legal|contract|agreement|nda|mou|compliance|insurance|indemnity)/.test(p))
+    return "Legal / Contracts";
+  if (/(drawing|drawings|cad|dwg|revit|bim|gfc|ga|layout|layouts|shop drawing)/.test(p))
+    return "Drawings / CAD / BIM";
+  if (/(site|execution|vendor|vendors|contractor|contractors|boq|measurement|materials?|procurement)/.test(p))
+    return "Site / Execution";
+  if (/(presentation|presentations|deck|decks|proposal|pitch|concept)/.test(p))
+    return "Client Decks / Presentations";
+  if (/(marketing|brand|portfolio|photos|renders?|3d|visuals?|social|instagram)/.test(p))
+    return "Marketing / Portfolio";
+  if (/(template|templates|sop|checklist|checklists|standards?|formats?)/.test(p))
+    return "Templates / Standards";
+  if (/(mom|minutes|meeting|approval|communication|client comms)/.test(p))
+    return "Client Communication / MOM";
+  if (/(wp-content|public_html|uploads|website)/.test(p))
+    return "Marketing / Portfolio";
+
+  // Fallback: name signals
+  if (/(invoice|bill|billing|receipt|payment|gst|tds|p&l|pnl|balance sheet|cash flow|expense|po\b|purchase order)/.test(n))
+    return "Finance / Accounts";
+  if (/(agreement|contract|nda|mou|terms|conditions|legal|compliance|insurance|indemnity)/.test(n))
+    return "Legal / Contracts";
+  if (/(salary|payroll|attendance|leave|hr\b|recruit|joining|onboarding|appraisal|policy|admin|office)/.test(n))
+    return "HR / Admin";
+  if (/(mom|minutes|meeting|call notes|approval|approved|client|email|whatsapp|discussion|feedback)/.test(n))
+    return "Client Communication / MOM";
+  if (/(site|snag|punch|execution|vendor|contractor|work progress|schedule|boq|measurement|material|procurement)/.test(n))
+    return "Site / Execution";
+  if (/(dwg|cad|autocad|revit|bim|floor plan|elevation|section|gfc|ga\b|layout|drawing)/.test(n))
+    return "Drawings / CAD / BIM";
+  if (/(ppt|presentation|deck|proposal|pitch|concept note|portfolio)/.test(n))
+    return "Client Decks / Presentations";
+  if (/(social|instagram|marketing|brand|photoshoot|render|3d|visual|portfolio|case study)/.test(n))
+    return "Marketing / Portfolio";
+  if (/(template|format|checklist|standard|sop|guideline|library)/.test(n))
+    return "Templates / Standards";
+
+  return "Uncategorized";
+}
+
+function extractProjectName_(folderPath) {
+  // Looks for the segment after known top-level folder names
+  // Adjust the topLevel list to match your actual Drive structure
+  const topLevel = [
+    "lab projects", "projects", "active projects",
+    "residential", "commercial", "interiors",
+    "clients", "client files", "ongoing"
+  ];
+
+  const parts = String(folderPath || "")
+    .split(/\s*\/\s*/)
+    .map(p => p.trim())
+    .filter(Boolean);
+
+  for (let i = 0; i < parts.length; i++) {
+    if (topLevel.includes(parts[i].toLowerCase()) && parts[i + 1]) {
+      return parts[i + 1]; // The segment after the known top-level
+    }
+  }
+
+  // Fallback: third segment of path if it exists (heuristic)
+  return parts[2] || "";
+}
+
+function mimeToFileType_(mimeType) {
+  const map = {
+    "application/vnd.google-apps.document":     "Google Doc",
+    "application/vnd.google-apps.spreadsheet":  "Google Sheet",
+    "application/vnd.google-apps.presentation": "Google Slides",
+    "application/vnd.google-apps.folder":       "Folder",
+    "application/vnd.google-apps.form":         "Google Form",
+    "application/pdf":                          "PDF",
+    "image/jpeg":                               "Image",
+    "image/png":                                "Image",
+    "image/gif":                                "Image",
+    "video/mp4":                                "Video",
+    "application/zip":                          "Archive",
+    "application/octet-stream":                 "CAD / Binary",
+    "text/plain":                               "Text",
+    "application/vnd.ms-excel":                 "Excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel",
+    "application/vnd.ms-powerpoint":            "PowerPoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint",
+    "application/msword":                       "Word Doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word Doc"
+  };
+  return map[mimeType] || mimeType.split("/").pop() || "Unknown";
+}
+
+function getAgeBucket_(modifiedTime) {
+  if (!modifiedTime) return "";
+  const now      = Date.now();
+  const modified = new Date(modifiedTime).getTime();
+  const days     = (now - modified) / (1000 * 60 * 60 * 24);
+
+  if (days <= 180) return "Active";
+  if (days <= 730) return "Stale";
+  return "Archive";
+}
+
+function computeSecurityRisk_(dept, access) {
+  const isPublic = (access === "Anyone with link");
+
+  if (isPublic && (dept === "Finance / Accounts" || dept === "Legal / Contracts" || dept === "HR / Admin"))
+    return "🔴 High";
+  if (isPublic && (dept === "Client Communication / MOM" || dept === "Client Decks / Presentations"))
+    return "🟡 Medium";
+  if (isPublic)
+    return "🟡 Medium";
+
+  return "🟢 Low";
+}
+
+
+/* ============================================================
+   SECTION 10 — DRIVE API HELPERS
+   ============================================================ */
+
+function listFilesPage_(pageToken) {
+  return Drive.Files.list({
+    pageSize:               CFG.fullIndex.pageSize,
+    pageToken:              pageToken || undefined,
+    fields:                 "nextPageToken, files(id,name,webViewLink,mimeType,size,owners(emailAddress),createdTime,modifiedTime,parents)",
+    includeItemsFromAllDrives: true,
+    supportsAllDrives:      true
+  });
+}
+
+function fetchFileMeta_(fileId) {
+  try {
+    return retryDriveGet_(fileId, "id,name,webViewLink,mimeType,size,owners(emailAddress),createdTime,modifiedTime,parents");
+  } catch(e) {
+    console.error("fetchFileMeta_ failed for", fileId, ":", e.message);
+    return null;
+  }
+}
+
+function getGeneralAccess_(fileId) {
+  try {
+    const resp  = Drive.Permissions.list(fileId, {
+      supportsAllDrives: true,
+      fields: "permissions(type,role)"
+    });
+    const perms = resp.permissions || [];
+    for (const p of perms) {
+      if (p.type === "anyone") return "Anyone with link";
+      if (p.type === "domain") return "Domain access";
+    }
+    return "Restricted";
+  } catch(e) {
+    return "Unknown";
+  }
+}
+
+function buildFolderPath_(folderId) {
+  const cache  = CacheService.getScriptCache();
+  const key    = "fp2:" + folderId;
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const parts   = [];
+  let   current = folderId;
+  const visited = new Set(); // guard against circular references
+
+  for (let i = 0; i < CFG.folderPath.maxDepth; i++) {
+    if (visited.has(current)) break; // circular guard
+    visited.add(current);
+
+    let meta;
+    try {
+      meta = retryDriveGet_(current, "id,name,parents");
+    } catch(e) {
+      break;
+    }
+
+    const name = String(meta.name || "").trim();
+    if (name) parts.unshift(name);
+
+    const parentIds = normalizeParentIds_(meta.parents);
+    if (!parentIds.length) break;
+
+    const parentId     = parentIds[0];
+    const parentCached = cache.get("fp2:" + parentId);
+
+    if (parentCached) {
+      const path = [parentCached, ...parts].filter(Boolean).join(" / ");
+      cache.put(key, path, CFG.folderPath.cacheTtlSecs);
+      return path;
+    }
+
+    current = parentId;
+  }
+
+  const path = parts.join(" / ").trim();
+  cache.put(key, path, CFG.folderPath.cacheTtlSecs);
+  return path;
+}
+
+function retryDriveGet_(id, fields) {
+  const maxTries = 5;
+  let   waitMs   = 400;
+
+  for (let t = 1; t <= maxTries; t++) {
+    try {
+      return Drive.Files.get(id, { supportsAllDrives: true, fields });
+    } catch(e) {
+      const msg = String(e && e.message ? e.message : e);
+      if (!/Rate Limit|Quota|Service invoked too many|Internal error|Backend Error|Timed out|User rate limit/i.test(msg)) {
+        throw e; // non-transient — fail immediately
+      }
+      if (t === maxTries) throw e;
+      Utilities.sleep(waitMs);
+      waitMs *= 2;
+    }
+  }
+}
+
+function normalizeParentIds_(parents) {
+  if (!parents || !parents.length) return [];
+  return parents
+    .map(p => (typeof p === "string" ? p : (p && p.id ? p.id : "")))
+    .filter(Boolean);
+}
+
+
+/* ============================================================
+   SECTION 11 — DRIVE ACTIVITY API HELPERS
+   ============================================================ */
+
+function storeFreshDeltaCursor_() {
+  try {
+    // Query with pageSize=1 to get the current cursor position
+    const resp = DriveActivity.Activity.query({ pageSize: 1 });
+    PropertiesService.getScriptProperties()
+      .setProperty(CFG.props.deltaCursor, resp.nextPageToken || "");
+  } catch(e) {
+    console.error("storeFreshDeltaCursor_ failed:", e.message);
+  }
+}
+
+function extractFileIdFromActivity_(activity) {
+  try {
+    // Primary target is in targets array
+    const targets = activity.targets || [];
+    for (const target of targets) {
+      if (target.driveItem && target.driveItem.name) {
+        // name format: "items/FILE_ID"
+        const parts = target.driveItem.name.split("/");
+        if (parts.length === 2 && parts[0] === "items") return parts[1];
+      }
+    }
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
+
+function extractEventType_(activity) {
+  try {
+    const actionDetail = activity.primaryActionDetail || {};
+
+    if (actionDetail.create)           return "CREATE";
+    if (actionDetail.edit)             return "EDIT";
+    if (actionDetail.move)             return "MOVE";
+    if (actionDetail.rename)           return "RENAME";
+    if (actionDetail.permissionChange) return "PERMISSION_CHANGE";
+    if (actionDetail.delete)           return "DELETE";
+    if (actionDetail.restore)          return "RESTORE";
+    if (actionDetail.comment)          return "COMMENT";
+
+    return "EDIT"; // safe default
+  } catch(e) {
+    return "EDIT";
+  }
+}
+
+
+/* ============================================================
+   SECTION 12 — SHEET UTILITIES
+   ============================================================ */
+
+function getIndexSheet_() {
+  const props = PropertiesService.getScriptProperties();
+  const ssId  = props.getProperty(CFG.props.ssId);
+  const ss    = ssId
+    ? SpreadsheetApp.openById(ssId)
+    : SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CFG.indexSheet);
+  if (!sh) throw new Error(`Sheet not found: ${CFG.indexSheet}`);
+  return sh;
+}
+
+function getOrCreateSheet_(ss, name) {
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function getHeaderMap_(sh) {
+  const raw = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  const map = {};
+  raw.forEach((h, i) => {
+    const key = String(h || "").trim();
+    if (key) map[key] = i + 1; // 1-based
+  });
+  return map;
+}
+
+function buildFileIdRowMap_(sh, colMap) {
+  const cId     = colMap["file_id"];
+  if (!cId) return {};
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return {};
+  const n   = lastRow - 1;
+  const ids = sh.getRange(2, cId, n, 1).getValues();
+  const map = {};
+  ids.forEach((row, i) => {
+    const id = String(row[0] || "").trim();
+    if (id) map[id] = i + 2; // 1-based sheet row
+  });
+  return map;
+}
+
+function formatHeaderRow_(sh) {
+  const range = sh.getRange(1, 1, 1, CFG.columns.length);
+  range.setFontWeight("bold")
+       .setBackground("#1a1a2e")
+       .setFontColor("#ffffff")
+       .setFontSize(10);
+  sh.setFrozenRows(1);
+}
+
+function appendRows_(sh, rows, colMap) {
+  if (!rows.length) return;
+  const startRow = sh.getLastRow() + 1;
+  sh.getRange(startRow, 1, rows.length, CFG.columns.length).setValues(rows);
+}
+
+function note_(sh, msg) {
+  try { sh.getRange("A1").setNote(String(msg || "")); } catch(e) {}
+  console.log(msg);
+}
+
+function deleteTriggersByHandler_(handlerName) {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction && t.getHandlerFunction() === handlerName)
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+
+/* ============================================================
+   SECTION 13 — STATUS & DIAGNOSTICS
+   ============================================================ */
+
+function showStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const sh    = getIndexSheet_();
+
+  const ssId        = props.getProperty(CFG.props.ssId)           || "(not set)";
+  const fullDone    = props.getProperty(CFG.props.fullIndexDone)   || "false";
+  const fullDoneAt  = props.getProperty(CFG.props.fullIndexDoneAt) || "(never)";
+  const deltaActive = props.getProperty(CFG.props.deltaActive)     || "false";
+  const deltaCursor = props.getProperty(CFG.props.deltaCursor)     ? "stored" : "(not set)";
+  const pathRow     = props.getProperty(CFG.props.pathRow)         || "(done)";
+  const totalRows   = sh.getLastRow() - 1;
+
+  const activeTriggers = ScriptApp.getProjectTriggers()
+    .map(t => t.getHandlerFunction())
+    .join(", ") || "(none)";
+
+  const msg =
+    `── LABWERK INDEX STATUS ──\n` +
+    `Spreadsheet ID : ${ssId}\n` +
+    `Total rows     : ${totalRows}\n` +
+    `Full index done: ${fullDone} (${fullDoneAt})\n` +
+    `Delta active   : ${deltaActive}\n` +
+    `Delta cursor   : ${deltaCursor}\n` +
+    `Enrichment row : ${pathRow}\n` +
+    `Active triggers: ${activeTriggers}\n` +
+    `Checked at     : ${new Date().toISOString()}`;
+
+  note_(sh, msg);
+  SpreadsheetApp.getUi().alert(msg);
+}
+
+
+/* ============================================================
+   SECTION 14 — MANUAL UTILITIES
+   (One-off helpers — safe to run anytime)
+   ============================================================ */
+
+// Force-restart enrichment from a specific row
+function restartEnrichmentFromRow(rowNumber) {
+  PropertiesService.getScriptProperties().setProperty(CFG.props.pathRow, String(rowNumber || 2));
+  startEnrichmentTriggers_();
+  console.log(`Enrichment restarted from row ${rowNumber}`);
+}
+
+// Re-run deduplication pass on demand
+function rerunDuplicateDetection() {
+  runDuplicateDetection();
+  console.log("Duplicate detection complete.");
+}
+
+// Clear delta cursor (forces delta to re-process recent activity)
+function resetDeltaCursor() {
+  storeFreshDeltaCursor_();
+  console.log("Delta cursor reset to current position.");
+}
+
+// Inspect a single file ID — useful for debugging
+function debugSingleFile(fileId) {
+  if (!fileId) throw new Error("Pass a fileId string");
+  const meta      = fetchFileMeta_(fileId);
+  const access    = getGeneralAccess_(fileId);
+  const parentIds = normalizeParentIds_(meta.parents);
+  const path      = parentIds.length ? buildFolderPath_(parentIds[0]) : "(no parent)";
+  const dept      = classifyDepartment_(path, meta.name);
+  const project   = extractProjectName_(path);
+
+  const report =
+    `File ID   : ${fileId}\n` +
+    `Name      : ${meta.name}\n` +
+    `Type      : ${mimeToFileType_(meta.mimeType)}\n` +
+    `Modified  : ${meta.modifiedTime}\n` +
+    `Access    : ${access}\n` +
+    `Parents   : ${parentIds.join(", ")}\n` +
+    `Path      : ${path}\n` +
+    `Dept      : ${dept}\n` +
+    `Project   : ${project}`;
+
+  console.log(report);
+  note_(getIndexSheet_(), report);
+  return report;
+}
